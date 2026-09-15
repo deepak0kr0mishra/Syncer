@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=SSD Sync
+GenericName=Folder Sync
+Comment=Two-way folder sync between laptop and external SSD (preview before anything is written)
+# NOTE: Exec and Path are rewritten by install-desktop-icon.sh for your machine.
+Exec=python3 /home/user/Syncer/sync_app.py
+Path=/home/user/Syncer
+Icon=drive-removable-media
+Terminal=false
+Categories=Utility;FileTools;
+Keywords=sync;backup;ssd;folders;
+StartupNotify=true

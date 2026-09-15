@@ -1,0 +1,20 @@
+# Private spec / notes — not shared on GitHub
+laptop-ssd-sync-spec.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Editors / OS
+.vscode/
+.idea/
+*~
+.DS_Store
+Thumbs.db
+
+# Local run artifacts (if ever created in-repo)
+*.log
