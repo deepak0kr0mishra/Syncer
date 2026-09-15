@@ -19,6 +19,11 @@ No cloud, no network, no daemons. Pick folders, preview changes, confirm.
   copied until you click **Confirm & Sync**.
 - **Newest-wins conflicts** — if both sides changed, the newer file wins and the
   older version is backed up as `name.conflict-bak-YYYYMMDD-HHMMSS`.
+  Backups can be turned off with the **Keep .conflict-bak backups** checkbox
+  in the footer (newer still wins, it just overwrites directly).
+- **exFAT-safe change detection** — the app remembers each side's timestamp
+  separately, so the 2-second timestamp rounding on FAT/exFAT drives can never
+  turn a one-sided edit into a fake conflict.
 - **Deletions never propagate** — a file deleted on one side is flagged
   `ORPHANED` and left alone on the other side. This is a hard rule.
 - **Skip files per sync** — uncheck files you don't want this time
@@ -159,6 +164,20 @@ write access.
 The history may have learned a state you didn't intend (e.g. you copied files
 manually behind its back). Fix: remove and re-add the pair to restart its
 history, then scan again.
+
+**Every sync makes a `.conflict-bak` file even though I only edited one side**
+That was a bug in versions before the per-side history fix: FAT/exFAT timestamp
+rounding made the untouched side look changed, so one-sided edits were treated
+as conflicts. Update to the latest version and the phantom backups stop. Old
+backups are ignored by sync and safe to delete once you've checked them:
+```bash
+# preview what would go, per pair folder (example: SSD side)
+find /media/$USER/SSD -name '*.conflict-bak-*' | head
+# delete them (laptop side too, if any)
+find /media/$USER/SSD "$HOME" -name '*.conflict-bak-*' -delete
+```
+If you never want backups at all, uncheck **Keep .conflict-bak backups** —
+true conflicts then resolve newer-wins with no extra copies.
 
 **I confirmed a conflict and regret it**
 Look next to the overwritten file for `*.conflict-bak-YYYYMMDD-HHMMSS` — that's

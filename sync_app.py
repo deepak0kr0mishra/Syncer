@@ -76,11 +76,11 @@ def ensure_dirs() -> None:
 def load_config() -> dict:
     ensure_dirs()
     if not CONFIG_FILE.exists():
-        return {"pairs": []}
+        return {"pairs": [], "keep_backups": True}
     try:
         data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
         if not isinstance(data, dict) or "pairs" not in data:
-            return {"pairs": []}
+            return {"pairs": [], "keep_backups": True}
         # sanitize
         pairs = []
         for p in data.get("pairs", []):
@@ -91,9 +91,9 @@ def load_config() -> dict:
                     "ssd": p["ssd"],
                     "name": p.get("name") or f"{Path(p['laptop']).name} ↔ {Path(p['ssd']).name}",
                 })
-        return {"pairs": pairs}
+        return {"pairs": pairs, "keep_backups": bool(data.get("keep_backups", True))}
     except Exception:
-        return {"pairs": []}
+        return {"pairs": [], "keep_backups": True}
 
 
 def save_config(cfg: dict) -> None:
@@ -204,20 +204,61 @@ def scan_files(root: Path) -> dict[str, FileInfo]:
     return out
 
 
-def _changed(current: FileInfo | None, entry: dict | None) -> bool:
+def _stored(entry: dict | None, side: str) -> tuple[float, int] | None:
+    """Return the (mtime, size) remembered for one side, or None if unknown.
+
+    Understands the current per-side format (``laptop_mtime``/``ssd_mtime``…)
+    and the legacy single-value format (``last_synced_mtime``…). Per-side
+    history matters: SSDs formatted exFAT/FAT round timestamps to 2 seconds
+    while ext4 keeps nanoseconds, so one shared timestamp makes the laptop
+    side look "changed" forever and turns every one-sided edit into a fake
+    conflict + backup.
+    """
+    if not isinstance(entry, dict):
+        return None
+    m = entry.get(f"{side}_mtime")
+    s = entry.get(f"{side}_size")
+    if m is None or s is None:
+        # legacy format: one timestamp shared by both sides
+        m = entry.get("last_synced_mtime")
+        s = entry.get("last_synced_size")
+    if m is None or s is None:
+        return None
+    try:
+        return float(m), int(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def _changed_side(current: FileInfo | None, entry: dict | None, side: str) -> bool:
+    """Did this side change since the last sync? Each side is compared only
+    against its own remembered state, so filesystem timestamp rounding on the
+    *other* side can never flag this side as changed."""
     if current is None or entry is None:
         return False
-    try:
-        old_m = float(entry.get("last_synced_mtime", 0))
-        old_s = int(entry.get("last_synced_size", -1))
-    except (TypeError, ValueError):
+    stored = _stored(entry, side)
+    if stored is None:
         return True
+    old_m, old_s = stored
     if current.size != old_s:
         return True
     return abs(current.mtime - old_m) > MTIME_EPS
 
 
-def plan_pair(pair: dict, manifest: dict) -> tuple[list[Action], dict]:
+def _manifest_entry(lap: FileInfo | None, ssd: FileInfo | None) -> dict:
+    """Build a per-side manifest entry from current scan results."""
+    e: dict = {}
+    if lap is not None:
+        e["laptop_mtime"] = lap.mtime
+        e["laptop_size"] = lap.size
+    if ssd is not None:
+        e["ssd_mtime"] = ssd.mtime
+        e["ssd_size"] = ssd.size
+    return e
+
+
+def plan_pair(pair: dict, manifest: dict,
+             keep_backups: bool = True) -> tuple[list[Action], dict]:
     """Compute planned actions for one pair. Returns (actions, manifest_updates_noop).
 
     manifest_updates_noop: entries to add for identical-on-both-sides first sync
@@ -258,8 +299,8 @@ def plan_pair(pair: dict, manifest: dict) -> tuple[list[Action], dict]:
             if not in_l and not in_s:
                 continue  # shouldn't happen; ignore
             if in_l and in_s:
-                ch_l = _changed(L, entry)
-                ch_s = _changed(S, entry)
+                ch_l = _changed_side(L, entry, "laptop")
+                ch_s = _changed_side(S, entry, "ssd")
                 if not ch_l and not ch_s:
                     continue  # unchanged
                 if ch_l and not ch_s:
@@ -273,19 +314,20 @@ def plan_pair(pair: dict, manifest: dict) -> tuple[list[Action], dict]:
                         label=KIND_LABEL["UPDATE_TO_LAPTOP"],
                         detail="SSD newer", src=ssd_p, dst=lap_p))
                 else:
-                    # both changed -> conflict, newest wins
+                    # both sides really changed -> conflict, newest wins
+                    bak = " — older version backed up" if keep_backups else " — overwrites older"
                     assert L is not None and S is not None
                     if L.mtime >= S.mtime:
                         actions.append(Action(
                             kind="CONFLICT_TO_SSD", relpath=rel, pair_name=pname,
                             label=KIND_LABEL["CONFLICT_TO_SSD"],
-                            detail="both changed, laptop newer — SSD version backed up",
+                            detail=f"both changed, laptop newer{bak}",
                             src=lap_p, dst=ssd_p))
                     else:
                         actions.append(Action(
                             kind="CONFLICT_TO_LAPTOP", relpath=rel, pair_name=pname,
                             label=KIND_LABEL["CONFLICT_TO_LAPTOP"],
-                            detail="both changed, SSD newer — laptop version backed up",
+                            detail=f"both changed, SSD newer{bak}",
                             src=ssd_p, dst=lap_p))
             else:
                 # present on only one side but was known -> deleted elsewhere.
@@ -320,30 +362,34 @@ def plan_pair(pair: dict, manifest: dict) -> tuple[list[Action], dict]:
                 except OSError:
                     same = False
                 if same:
-                    # identical content: nothing to copy, just learn it
-                    newest = max(L.mtime, S.mtime)
-                    biggest = max(L.size, S.size)
-                    noop_updates[rel] = {"last_synced_mtime": newest,
-                                         "last_synced_size": biggest}
+                    # identical content: nothing to copy, just learn each side as-is
+                    noop_updates[rel] = _manifest_entry(L, S)
                 else:
+                    bak = " — older version backed up" if keep_backups else " — overwrites older"
                     if L.mtime >= S.mtime:
                         actions.append(Action(
                             kind="CONFLICT_TO_SSD", relpath=rel, pair_name=pname,
                             label=KIND_LABEL["CONFLICT_TO_SSD"],
-                            detail="on both sides (first sync), laptop newer — SSD version backed up",
+                            detail=f"on both sides (first sync), laptop newer{bak}",
                             src=lap_p, dst=ssd_p))
                     else:
                         actions.append(Action(
                             kind="CONFLICT_TO_LAPTOP", relpath=rel, pair_name=pname,
                             label=KIND_LABEL["CONFLICT_TO_LAPTOP"],
-                            detail="on both sides (first sync), SSD newer — laptop version backed up",
+                            detail=f"on both sides (first sync), SSD newer{bak}",
                             src=ssd_p, dst=lap_p))
     return actions, noop_updates
 
 
 def execute_actions(pair: dict, actions: list[Action],
-                    manifest: dict, noop_updates: dict | None = None) -> tuple[dict, list[str]]:
-    """Copy files for write-actions, update manifest. Returns (new_manifest, errors)."""
+                    manifest: dict, noop_updates: dict | None = None,
+                    keep_backups: bool = True) -> tuple[dict, list[str]]:
+    """Copy files for write-actions, update manifest. Returns (new_manifest, errors).
+
+    The manifest remembers each side separately (laptop vs SSD timestamps), so
+    filesystem timestamp rounding on one side can never fake a change on the
+    other side on the next scan.
+    """
     manifest = dict(manifest)
     if noop_updates:
         manifest.update(noop_updates)
@@ -358,21 +404,35 @@ def execute_actions(pair: dict, actions: list[Action],
             if not a.src.is_file():
                 errors.append(f"{a.relpath}: source vanished, skipped")
                 continue
-            # Conflict: back up the older (destination) version first.
+            # True conflict: back up the older (destination) version first.
             if a.kind.startswith("CONFLICT") and a.dst.exists():
-                backup = a.dst.parent / f"{a.dst.name}.conflict-bak-{ts}"
-                try:
-                    backup.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(str(a.dst), str(backup))
-                    log_to_file(f"BACKUP {pair.get('name','')} :: {a.relpath} -> {backup.name}")
-                except OSError as e:
-                    errors.append(f"{a.relpath}: backup failed ({e}), skipped overwrite")
-                    continue
+                if keep_backups:
+                    backup = a.dst.parent / f"{a.dst.name}.conflict-bak-{ts}"
+                    try:
+                        backup.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(str(a.dst), str(backup))
+                        log_to_file(f"BACKUP {pair.get('name','')} :: {a.relpath} -> {backup.name}")
+                    except OSError as e:
+                        errors.append(f"{a.relpath}: backup failed ({e}), skipped overwrite")
+                        continue
+                else:
+                    log_to_file(f"BACKUP-SKIPPED (disabled) {pair.get('name','')} :: {a.relpath}")
             a.dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(str(a.src), str(a.dst))
-            st = a.dst.stat()
-            manifest[a.relpath] = {"last_synced_mtime": st.st_mtime,
-                                   "last_synced_size": st.st_size}
+            # Remember each side's own post-copy state.
+            try:
+                st_src = a.src.stat()
+            except OSError:
+                st_src = None
+            st_dst = a.dst.stat()
+            if a.kind.endswith("_TO_SSD"):
+                lap_m, lap_s = (st_src.st_mtime, st_src.st_size) if st_src else (st_dst.st_mtime, st_dst.st_size)
+                ssd_m, ssd_s = st_dst.st_mtime, st_dst.st_size
+            else:  # _TO_LAPTOP
+                lap_m, lap_s = st_dst.st_mtime, st_dst.st_size
+                ssd_m, ssd_s = (st_src.st_mtime, st_src.st_size) if st_src else (st_dst.st_mtime, st_dst.st_size)
+            manifest[a.relpath] = {"laptop_mtime": lap_m, "laptop_size": lap_s,
+                                   "ssd_mtime": ssd_m, "ssd_size": ssd_s}
             log_to_file(f"{a.label} {pair.get('name','')} :: {a.relpath} ({a.detail})")
         except OSError as e:
             errors.append(f"{a.relpath}: {e}")
@@ -861,8 +921,27 @@ class SyncApp(tk.Tk):
         self.progress.pack(fill="x", pady=(0, 6))
         self.status = ttk.Label(footer, text="Idle.", style="Muted.TLabel")
         self.status.pack(side="left")
-        ttk.Label(footer, text="Deletions are never propagated. Conflicts keep a .conflict-bak backup.",
+        self.backup_var = tk.BooleanVar(value=bool(self.cfg.get("keep_backups", True)))
+        self.backup_check = tk.Checkbutton(
+            footer, text="Keep .conflict-bak backups",
+            variable=self.backup_var, command=self.on_toggle_backups,
+            bg=BG, fg=MUTED, selectcolor=CARD2, activebackground=BG,
+            activeforeground=FG, relief="flat", font=("TkDefaultFont", 8))
+        self.backup_check.pack(side="right", padx=(12, 0))
+        ttk.Label(footer, text="Deletions are never propagated.",
                   style="Muted.TLabel").pack(side="right")
+
+    def on_toggle_backups(self) -> None:
+        self.cfg["keep_backups"] = bool(self.backup_var.get())
+        save_config(self.cfg)
+        state = "ON — older versions are kept as .conflict-bak" if self.cfg["keep_backups"] \
+            else "OFF — newer file simply overwrites, no backup copies"
+        log_to_file(f"CONFIG keep_backups = {self.cfg['keep_backups']}")
+        self._append_log(f"Conflict backups {state}.")
+        # detail lines in the current preview were computed with the old setting
+        if self.pending:
+            self._clear_preview()
+            self._set_status("Setting changed — click Check for Changes to re-scan.")
 
     # -- pairs ----------------------------------------------------------
     def _refresh_pairs(self) -> None:
@@ -1015,10 +1094,11 @@ class SyncApp(tk.Tk):
         try:
             pending: list[tuple[dict, Action]] = []
             noops: dict[str, dict] = {}
+            keep = bool(self.cfg.get("keep_backups", True))
             for pair in self.cfg["pairs"]:
                 manifest = load_manifest(pair["id"])
                 self.manifests[pair["id"]] = manifest
-                actions, noop = plan_pair(pair, manifest)
+                actions, noop = plan_pair(pair, manifest, keep_backups=keep)
                 noops[pair["id"]] = noop
                 for a in actions:
                     pending.append((pair, a))
@@ -1191,11 +1271,15 @@ class SyncApp(tk.Tk):
             return
         n_conflict = sum(1 for _, a in writes if a.kind.startswith("CONFLICT"))
         n_skip = len(self.skipped_keys)
+        keep = bool(self.cfg.get("keep_backups", True))
         msg = f"Copy {len(writes)} file(s)?"
         if n_skip:
             msg += f"\n({n_skip} skipped file(s) will stay untouched.)"
         if n_conflict:
-            msg += f"\n\nIncluding {n_conflict} conflict(s) — the older version will be kept as .conflict-bak-TIMESTAMP first."
+            if keep:
+                msg += f"\n\nIncluding {n_conflict} conflict(s) — the older version will be kept as .conflict-bak-TIMESTAMP first."
+            else:
+                msg += f"\n\nIncluding {n_conflict} conflict(s) — newer overwrites older with NO backup (you turned backups off)."
         msg += "\n\nDeletions are NEVER propagated."
         if not messagebox.askyesno(APP_NAME, msg):
             return
@@ -1217,7 +1301,8 @@ class SyncApp(tk.Tk):
             for pid, (pair, acts) in by_pair.items():
                 manifest = self.manifests.get(pid, load_manifest(pid))
                 new_manifest, errs = execute_actions(
-                    pair, acts, manifest, self.pending_noops.get(pid, {}))
+                    pair, acts, manifest, self.pending_noops.get(pid, {}),
+                    keep_backups=bool(self.cfg.get("keep_backups", True)))
                 # persist noop-only manifests too (identical first-sync files)
                 if not [a for a in acts if a.kind in KINDS_WRITE] and self.pending_noops.get(pid):
                     new_manifest = {**manifest, **self.pending_noops[pid]}
