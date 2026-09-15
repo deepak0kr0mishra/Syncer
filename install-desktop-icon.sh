@@ -23,8 +23,9 @@ fi
 
 mkdir -p "$DEST_DIR"
 # Rewrite Exec/Path with the real location of this checkout.
+# (Exec arg is quoted per spec; Path must be a bare absolute path.)
 sed -e "s|^Exec=.*|Exec=python3 \"$APP_DIR/sync_app.py\"|" \
-    -e "s|^Path=.*|Path=\"$APP_DIR\"|" \
+    -e "s|^Path=.*|Path=$APP_DIR|" \
     "$SRC" > "$DEST"
 chmod +x "$DEST"
 
